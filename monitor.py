@@ -153,12 +153,16 @@ class RemoteState:
         self.sha = result['content']['sha']
 
 
+class CliFailure(RuntimeError):
+    pass
+
+
 def cli(args):
     result = subprocess.run(['lark-cli', 'im', *args, '--as', 'bot', '--json'],
                             capture_output=True, text=True, timeout=50)
     if result.returncode:
         # Raw errors may contain group identifiers or message contents.
-        raise RuntimeError('Lark CLI failed; outbound attempt retained for safe recovery')
+        raise CliFailure(json.dumps({'exit': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr}))
     data = json.loads(result.stdout)
     if data.get('ok') is not True:
         raise RuntimeError('Lark CLI returned an unsuccessful result')
@@ -221,7 +225,12 @@ def main():
     state['lastCheckedDay'] = now()[:10]
     if state != before:
         remote.save(state)
-    delivered = deliver(state, remote.save)
+    try:
+        delivered = deliver(state, remote.save)
+    except CliFailure as error:
+        state['diagnostic'] = str(error)
+        remote.save(state)  # Diagnostics stay encrypted, never in public logs.
+        raise
     print(f'Checked {len(events)} events; queued {added}; verified deliveries {delivered}.')
 
 
