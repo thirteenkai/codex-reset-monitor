@@ -42,4 +42,16 @@ jobs:
           LARKSUITE_CLI_STRICT_MODE: bot
           LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1'
           LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1'
-        run: python3 monitor.py
+        run: |
+          python3 - <<'PYTHON'
+          import os, subprocess
+          app_id = os.environ.pop('LARKSUITE_CLI_APP_ID')
+          app_secret = os.environ.pop('LARKSUITE_CLI_APP_SECRET')
+          result = subprocess.run(
+              ['lark-cli', 'config', 'init', '--app-id', app_id,
+               '--app-secret-stdin', '--brand', 'feishu'],
+              input=app_secret, text=True, capture_output=True)
+          if result.returncode:
+              raise SystemExit('Bot configuration failed; credentials were not logged')
+          subprocess.run(['python3', 'monitor.py'], check=True)
+          PYTHON
