@@ -1,0 +1,5 @@
+__pycache__/
+.runtime/
+.env*
+CURRENT.md
+*.plain.json
