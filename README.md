@@ -26,3 +26,14 @@ Check AIHOT's public Codex reset API every five minutes and send new announcemen
 `python3 -m pip install -r requirements.txt` then `python3 -m unittest discover -s tests -v`.
 
 To pause delivery immediately, disable the **Codex reset monitor** workflow in Actions. Also pause the external scheduler to prevent failed dispatch requests. Disabling only the external scheduler leaves the GitHub fallback schedule active. A successful manual run verifies execution; consecutive automatic calls in the scheduler history and corresponding completed GitHub runs separately verify scheduling.
+
+## Official AIHOT hot topics
+
+The same cloud trigger also runs `hot_topics.py` as a separate job after the reset check. A reset-check failure does not skip the hot-topics job. Delivery uses the existing bot and configured destination. No model or additional external credentials are needed.
+
+- Use the official `/api/v1/hot-topics` selection and `rank` directly, with no additional topic, score, source-count, or business-relevance threshold. These are official rankings; notification deduplication is our client behavior, not an AIHOT push rule.
+- Poll at most once per 300 seconds using ETag/If-None-Match; honor Retry-After on 429/503. Small scheduler jitter is absorbed by a short wait. Unchanged responses do not produce notifications.
+- The initial list is a silent baseline. Later, notify once per newly seen official story (or item ID if no story exists), preserving rank and linking to the official reading page and story timeline. Re-entry, rank/count changes, or a different representative item for the same story do not resend. Label latestAt as latest signal time, not publication time or breaking-news time.
+- Keep independent encrypted state in `hot-topics-state.enc`, bound to the bot and destination. Retain pending intent before delivery and the receipt before readback; verify sender, destination, and message content. Never silently replace missing or corrupt state.
+- Initial setup: dispatch this workflow once with `initialize_hot_topics=true` while HOT_TOPICS_ENABLED is unset/false. This performs bot/chat checks and a dry-run, then saves the initial baseline without sending it. Only after success set repository variable `HOT_TOPICS_ENABLED=true`. Repeating initialization preserves an existing baseline. Subsequent normal five-minute dispatches poll automatically.
+- Pause only hot topics by setting `HOT_TOPICS_ENABLED=false`; this leaves the reset monitor running. Token renewal is shared with the external scheduler described above.

@@ -3,6 +3,11 @@ on:
   schedule:
     - cron: '2-57/5 * * * *'
   workflow_dispatch:
+    inputs:
+      initialize_hot_topics:
+        description: Initialize official hot topics baseline without sending history
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -54,4 +59,52 @@ jobs:
           if result.returncode:
               raise SystemExit('Bot configuration failed; credentials were not logged')
           subprocess.run(['python3', 'monitor.py'], check=True)
+          PYTHON
+
+  hot-topics:
+    name: Official AIHOT hot topics
+    needs: monitor
+    if: ${{ always() && github.repository == vars.DEPLOYMENT_REPOSITORY && github.ref == 'refs/heads/main' && (vars.HOT_TOPICS_ENABLED == 'true' || github.event.inputs.initialize_hot_topics == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install pinned dependencies
+        run: |
+          python3 -m pip install -r requirements.txt --quiet
+          curl --fail --silent --show-error --location --max-time 60 https://github.com/larksuite/cli/releases/download/v1.0.93/lark-cli-1.0.93-linux-amd64.tar.gz -o /tmp/lark-cli.tar.gz
+          echo '10031849a1884bf9165cb01de47102b4847fba81bb9eb76f4168125ea9746c51  /tmp/lark-cli.tar.gz' | sha256sum --check
+          mkdir -p /tmp/lark-bin
+          tar -xzf /tmp/lark-cli.tar.gz -C /tmp/lark-bin
+          echo '/tmp/lark-bin' >> "$GITHUB_PATH"
+      - name: Regression checks
+        run: python3 -m unittest discover -s tests -v
+      - name: Poll official hot topics and notify new entries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_APP_ID: ${{ secrets.LARK_APP_ID }}
+          INITIALIZE_HOT_TOPICS: ${{ github.event.inputs.initialize_hot_topics || 'false' }}
+          STATE_KEY: ${{ secrets.STATE_KEY }}
+          LARK_CHAT_ID: ${{ secrets.LARK_CHAT_ID }}
+          LARKSUITE_CLI_APP_ID: ${{ secrets.LARK_APP_ID }}
+          LARKSUITE_CLI_APP_SECRET: ${{ secrets.LARK_APP_SECRET }}
+          LARKSUITE_CLI_BRAND: feishu
+          LARKSUITE_CLI_DEFAULT_AS: bot
+          LARKSUITE_CLI_STRICT_MODE: bot
+          LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1'
+          LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1'
+        run: |
+          python3 - <<'PYTHON'
+          import os, subprocess
+          app_id = os.environ.pop('LARKSUITE_CLI_APP_ID')
+          app_secret = os.environ.pop('LARKSUITE_CLI_APP_SECRET')
+          result = subprocess.run(
+              ['lark-cli', 'config', 'init', '--app-id', app_id,
+               '--app-secret-stdin', '--brand', 'feishu'],
+              input=app_secret, text=True, capture_output=True)
+          if result.returncode:
+              raise SystemExit('Bot configuration failed; credentials were not logged')
+          subprocess.run(['python3', 'hot_topics.py'], check=True)
           PYTHON
