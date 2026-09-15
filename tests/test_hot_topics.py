@@ -19,13 +19,36 @@ def item(index=1, story='event-1'):
 
 @patch.dict(os.environ, {'LARK_CHAT_ID': 'test-chat', 'EXPECTED_APP_ID': 'test-app'})
 class HotTopicsTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = patch('hot_topics.now', return_value='2026-09-15T02:10:00Z')
+        self.clock.start()
+        self.addCleanup(self.clock.stop)
+        self.fetch = patch('hot_topics.fetch_story', side_effect=lambda i: self.story(i))
+        self.fetch.start()
+        self.addCleanup(self.fetch.stop)
+
+    def story(self, value):
+        if not value['links'].get('story'):
+            return None
+        return {'publicId': value['links']['story'].rsplit('/', 1)[1],
+                'firstReportAt': '2026-09-15T01:00:00Z',
+                'latestAt': '2026-09-15T02:00:00Z', 'latest': '官方新增进展',
+                'reports': [{'id': 'report-1', 'title': '本次报道标题',
+                             'publishedAt': '2026-09-15T02:00:00Z',
+                             'links': {'aihot': 'https://aihot.news/items/report-1'}}]}
+
+    def ready(self, items):
+        state = hot.baseline(items, None)
+        hot.discover(state, items)
+        return state
+
     def test_initialization_never_broadcasts_history(self):
-        state = hot.baseline([item()], 'etag')
+        state = self.ready([item()])
         self.assertFalse(state['pending'])
         self.assertEqual(hot.discover(state, [item()]), 0)
 
     def test_new_official_event_only_once_even_after_leaving_and_reentering(self):
-        state = hot.baseline([item()], 'etag')
+        state = self.ready([item()])
         self.assertEqual(hot.discover(state, [item(2, 'event-2')]), 1)
         hot.discover(state, [])
         newer = item(3, 'event-2')
@@ -58,11 +81,70 @@ class HotTopicsTests(unittest.TestCase):
     def test_render_preserves_official_rank_and_labels_time_honestly(self):
         value = item()
         value['title'] = '<at user_id="all"> ![image](https://evil.test)'
-        rendered = hot.render(value)
+        report = self.story(value)['reports'][0]
+        report['title'] = value['title']
+        rendered = hot.render(value, self.story(value), report)
         self.assertIn('第 1 名', rendered)
-        self.assertIn('最新信号：2026-09-15 10:00', rendered)
+        self.assertIn('本次报道：2026-09-15 10:00', rendered)
+        self.assertIn('事件首报：', rendered)
+        self.assertNotIn('新上榜', rendered)
         self.assertNotIn('<at', rendered)
         self.assertNotIn('![', rendered)
+
+    def test_old_event_with_recent_signal_is_silent(self):
+        state = self.ready([])
+        story = self.story(item())
+        story['firstReportAt'] = '2026-09-08T06:57:09Z'
+        self.assertEqual(hot.discover(state, [item()], lambda _: story), 0)
+        self.assertFalse(state['pending'])
+
+    def test_migration_preserves_receipts_and_silently_baselines(self):
+        state = hot.baseline([], None)
+        state['pending'] = {'draft': {'phase': 'prepared'}, 'receipt': {'phase': 'sent'}}
+        state['sent'] = {'existing': {'messageId': 'old'}}
+        self.assertEqual(hot.discover(state, [item()]), 0)
+        self.assertNotIn('draft', state['pending'])
+        self.assertIn('receipt', state['pending'])
+        self.assertIn('existing', state['sent'])
+
+    def test_missing_timeline_cannot_send(self):
+        state = self.ready([])
+        self.assertEqual(hot.discover(state, [item()], lambda _: None), 0)
+
+    def test_new_report_and_changed_progress_required_for_old_story(self):
+        state = self.ready([item()])
+        story = self.story(item())
+        story['firstReportAt'] = '2026-09-08T06:57:09Z'
+        story['reports'][0].update(id='report-2', publishedAt='2026-09-15T02:11:00Z')
+        story['latest'] = '新增官方进展'
+        with patch('hot_topics.now', return_value='2026-09-15T02:15:00Z'):
+            self.assertEqual(hot.discover(state, [item()], lambda _: story), 1)
+            self.assertEqual(hot.discover(state, [item()], lambda _: story), 0)
+        body = next(iter(state['pending'].values()))['body']
+        self.assertIn('事件进展', body)
+        self.assertIn('新增官方进展', body)
+        self.assertIn('2026-09-08', body)
+
+    def test_new_report_without_progress_change_is_silent(self):
+        state = self.ready([item()])
+        story = self.story(item())
+        story['reports'][0].update(id='report-2', publishedAt='2026-09-15T02:11:00Z')
+        with patch('hot_topics.now', return_value='2026-09-15T02:15:00Z'):
+            self.assertEqual(hot.discover(state, [item()], lambda _: story), 0)
+
+    def test_304_still_checks_cached_story_timeline(self):
+        state = self.ready([item()])
+        state['lastPollAt'] = '2026-09-15T02:00:00Z'
+        with patch('hot_topics.HotState') as remote, patch('hot_topics.fetch_topics', return_value=(None, 'etag')), patch('hot_topics.fetch_story', return_value=self.story(item())) as fetch:
+            remote.return_value.load.return_value = state
+            hot.main()
+            fetch.assert_called_once_with(item())
+
+    def test_summary_change_without_new_report_is_silent(self):
+        state = self.ready([item()])
+        story = self.story(item())
+        story['latest'] = '仅改写综述'
+        self.assertEqual(hot.discover(state, [item()], lambda _: story), 0)
 
     @patch('hot_topics.urllib.request.urlopen')
     def test_conditional_request_and_304(self, request):
@@ -78,7 +160,7 @@ class HotTopicsTests(unittest.TestCase):
         self.assertGreater((hot.timestamp(caught.exception.retry_at) - hot.timestamp(hot.now())).total_seconds(), 1190)
 
     def test_failed_content_readback_retains_receipt_and_never_resends(self):
-        state = hot.baseline([], None)
+        state = self.ready([])
         hot.discover(state, [item()])
         sent = []
         def call(args):

@@ -1,4 +1,4 @@
-"""Notify once per newly listed AIHOT event, using the official ranking unchanged."""
+"""Notify recent events and evidenced timeline updates from the official AIHOT ranking."""
 import copy
 import json
 import os
@@ -83,16 +83,47 @@ def fetch_topics(etag=None):
         raise RuntimeError('Official hot topics request failed') from None
 
 
-def render(item):
-    lines = ['**AIHOT 官方热点 · 新上榜**',
-             f"第 {item['rank']} 名｜{text(item['title'])}", '',
-             f"独立信源：{item['sourceCount']} 个 · 信号：{item['signalCount']} 条",
-             '最新信号：' + beijing(item['latestAt']) + '（北京时间）',
-             '新上榜不代表事件刚发生。', '',
-             f"[AIHOT 阅读]({item['links']['aihot']})"]
-    if item['links'].get('story'):
-        lines.append(f"[事件时间线与官方综述]({item['links']['story']})")
-    lines.append('数据来源：AIHOT；按官方榜单排名展示。')
+def fetch_story(item):
+    if not item['links'].get('story'):
+        return None
+    public_id = event_key(item).split(':', 1)[1]
+    request = urllib.request.Request(
+        'https://aihot.virxact.com/api/v1/stories/' + public_id,
+        headers={'Accept': 'application/json', 'User-Agent': 'aihot-hot-topics-monitor/1.1'})
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            data = json.load(response)
+    except urllib.error.HTTPError as error:
+        if error.code in (429, 503):
+            raise RateLimited(error.headers.get('Retry-After')) from None
+        if error.code == 404:
+            return None
+        raise
+    story = data['story']
+    if data.get('schemaVersion') != 1 or not story.get('publicId'):
+        raise ValueError('Invalid story')
+    timestamp(story['firstReportAt'])
+    timestamp(story['latestAt'])
+    if not isinstance(story.get('latest'), str) or not isinstance(story.get('reports'), list):
+        raise ValueError('Incomplete story timeline')
+    for report in story['reports']:
+        timestamp(report['publishedAt'])
+        trusted_link(report['links']['aihot'], '/items/')
+    return story
+
+
+def render(item, story=None, report=None, update=False):
+    if story is None:
+        return 'AIHOT 热点监控接入检查（不发送）'
+    lines = ['**AIHOT 官方热点 · ' + ('事件进展' if update else '近期事件') + '**',
+             f"第 {item['rank']} 名｜{text(report['title'])}", '',
+             '最新进展（AIHOT 综述）：' + text(story['latest']), '',
+             '事件首报：' + beijing(story['firstReportAt']) + '（北京时间）',
+             '本次报道：' + beijing(report['publishedAt']) + '（北京时间）',
+             '报道来源：' + text(report.get('source', {}).get('name', 'AIHOT')), '',
+             f"[本次报道]({report['links']['aihot']})",
+             f"[事件时间线]({item['links']['story']})",
+             '数据来源：AIHOT；排名沿用官方榜单，时效与去重为本监控规则。']
     return '\n'.join(lines)
 
 
@@ -104,20 +135,52 @@ def baseline(items, etag):
             'chatId': os.environ['LARK_CHAT_ID'], 'appId': os.environ['EXPECTED_APP_ID']}
 
 
-def discover(state, items):
+def discover(state, items, story_fetch=None):
+    story_fetch = story_fetch or fetch_story
     added = 0
+    migrating = state.get('freshnessVersion') != 2
+    current = timestamp(now())
+    # Cancel only unsent legacy drafts; retain uncertain sends and receipts for reconciliation.
+    for key, pending in list(state['pending'].items()):
+        if migrating and pending['phase'] == 'prepared':
+            del state['pending'][key]
     for item in items:
         key = event_key(item)
         alias = state['itemAliases'].get(item['id'])
-        # Attaching a story link later must not turn an already seen item into new news.
-        known = key in state['events'] or alias in state['events']
-        if not known:
-            delivery_key = 'hot-' + digest(key)[:40]
-            if delivery_key not in state['pending'] and delivery_key not in state['sent']:
-                state['pending'][delivery_key] = {'body': render(item), 'phase': 'prepared'}
-                added += 1
-        state['events'].setdefault(key, {'firstSeenAt': now()})
+        previous = state['events'].get(key) or state['events'].get(alias)
+        story = story_fetch(item)
         state['itemAliases'][item['id']] = key
+        if not story:
+            state['events'].setdefault(key, {'firstSeenAt': now()})
+            continue
+        canonical = 'story:' + story['publicId']
+        previous = state['events'].get(canonical) or previous
+        reports = sorted(story['reports'], key=lambda r: timestamp(r['publishedAt']), reverse=True)
+        record = dict(previous or {'firstSeenAt': now()})
+        old_ids = set(record.get('reportIds', []))
+        fresh_reports = [r for r in reports if r['id'] not in old_ids
+                         and timedelta(0) <= current - timestamp(r['publishedAt']) <= timedelta(hours=48)]
+        recent_event = timedelta(0) <= current - timestamp(story['firstReportAt']) <= timedelta(hours=48)
+        update = bool(previous and 'latestSummary' in previous)
+        eligible = not migrating and fresh_reports and (
+            (not previous and recent_event) or
+            (update and story['latest'].strip() != previous['latestSummary']
+             and any(timestamp(r['publishedAt']) > timestamp(previous['observedAt']) for r in fresh_reports)))
+        if eligible:
+            report = next((r for r in fresh_reports if not update or
+                           timestamp(r['publishedAt']) > timestamp(previous['observedAt'])), None)
+            delivery_key = 'hot-v2-' + digest(canonical + ':' + report['id'])[:40]
+            if delivery_key not in state['pending'] and delivery_key not in state['sent']:
+                state['pending'][delivery_key] = {
+                    'body': render(item, story, report, update), 'phase': 'prepared'}
+                added += 1
+        record.update(reportIds=sorted(old_ids | {r['id'] for r in reports}),
+                      latestSummary=story['latest'].strip(), observedAt=now())
+        state['events'][canonical] = record
+        state['events'][key] = record
+        state['itemAliases'][item['id']] = canonical
+    state['freshnessVersion'] = 2
+    state['cachedItems'] = items
     return added
 
 
@@ -203,12 +266,12 @@ def main():
         print('Official hot topics: cached interval; waiting for next poll.')
         return
     try:
-        items, etag = fetch_topics(state.get('etag'))
+        items, etag = fetch_topics(state.get('etag') if state.get('freshnessVersion') == 2 else None)
+        added = discover(state, items if items is not None else state.get('cachedItems', []))
     except RateLimited as error:
         state['retryAfter'] = error.retry_at
         remote.save(state)
         raise
-    added = discover(state, items) if items is not None else 0
     state.update(etag=etag, lastPollAt=now())
     state.pop('retryAfter', None)
     if state != before:
